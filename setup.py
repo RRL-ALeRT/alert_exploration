@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            '3d_frontier_exploration = alert_exploration.3d_frontier_exploration:main'
+            'mbf_exploration = alert_exploration.mbf_exploration:main'
         ],
     },
 )
