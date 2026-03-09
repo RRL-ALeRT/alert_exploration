@@ -15,7 +15,7 @@ import math
 import numpy as np
 import tf2_ros
 
-from utils import PointCloudFrontierDetector
+from alert_exploration.utils import PointCloudFrontierDetector
 
 # SETTINGS
 CLOUD_TOPIC = '/navigation/octomap_point_cloud_centers'
