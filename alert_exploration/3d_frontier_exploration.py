@@ -17,14 +17,14 @@ import tf2_ros
 
 from alert_exploration.utils import PointCloudFrontierDetector
 
-CLOUD_TOPIC = '/navigation/octomap_point_cloud_centers'
+CLOUD_TOPIC = '/octomap_point_cloud_centers'
 ACTION_SERVER_NAME = '/move_base_flex/move_base'
 MAP_FRAME = 'map'
-ROBOT_FRAME = 'base_footprint'
+ROBOT_FRAME = 'body'
 MIN_GOAL_DISTANCE = 0.5
 GOAL_OFFSET_DISTANCE = 0.75  
 WAIT_AFTER_SUCCESS = 1.0
-NAV_GOAL_TIMEOUT = 30.0
+NAV_GOAL_TIMEOUT = 90.0
 
 MAX_NO_FRONTIER_TICKS = 10  # Seconds to wait with no goals before triggering Phase 2
 

@@ -8,8 +8,8 @@ from rclpy.time import Time
 # Default configuration parameters for the frontier detection pipeline
 DEFAULT_PARAMS = {
     # --- Perception Settings ---
-    'voxel_size': 0.15,         # Downsampling grid size (meters)
-    'neighbor_radius': 0.45,    # Radius for local neighborhood search
+    'voxel_size': 0.1,         # Downsampling grid size (meters)
+    'neighbor_radius': 0.5,    # Radius for local neighborhood search
     'min_neighbors': 5,         # Minimum points required in a radius to be considered valid
     
     # --- Filtering & Memory Settings ---
@@ -20,7 +20,7 @@ DEFAULT_PARAMS = {
     
     # --- Framework Settings ---
     'map_frame': 'map',         # ROS coordinate frame for visualization
-    'goal_strategy': 'closest'  # Strategy to pick the best goal ('closest' or 'utility')
+    'goal_strategy': 'utility'  # Strategy to pick the best goal ('closest' or 'utility')
 }
 
 class PointCloudFrontierDetector:
