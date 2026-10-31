@@ -24,7 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            '3d_frontier_exploration = alert_exploration.3d_frontier_exploration:main'
+            '3d_frontier_exploration = alert_exploration.3d_frontier_exploration:main',
+            'pointcloud_surface_segmentation = alert_exploration.pointcloud_surface_segmentation:main',
+            'red_surface_mbf_navigator = alert_exploration.red_surface_mbf_navigator:main',
         ],
     },
 )

@@ -15,6 +15,10 @@ DEFAULT_PARAMS = {
     # --- Filtering & Memory Settings ---
     'min_dist_from_robot': 0.8, # Ignore goals too close to the robot (meters)
     'max_height_diff': 1.5,     # Ignore goals too far above/below the robot (meters)
+    'pallet_surface_z': None,   # Z height of the pallet top in the map frame
+    'pallet_height_tolerance': 0.12,  # Allowed frontier height variation on the pallet
+    'pallet_bounds': None,      # (min_x, max_x, min_y, max_y) in the map frame
+    'pallet_edge_margin': 0.5,  # Do not navigate this close to a pallet edge
     'visited_radius': 1.5,      # Radius around past goals to mark as explored
     'blacklist_radius': 1.0,    # Radius around unreachable/failed goals
     
@@ -34,6 +38,14 @@ class PointCloudFrontierDetector:
         self.params = DEFAULT_PARAMS.copy()
         if params:
             self.params.update(params)
+        self.last_stats = {
+            'point_count': 0,
+            'boundary_count': 0,
+            'raw_goal_count': 0,
+            'filtered_goal_count': 0,
+            'raw_goal_z_range': None,
+            'rejections': {},
+        }
 
     def process_pointcloud(self, pts_array, robot_pose, blacklist=None, visited=None):
         """
@@ -44,6 +56,17 @@ class PointCloudFrontierDetector:
 
         # 1. Extract raw boundary points, cluster them into goals, and get their point counts (sizes)
         boundary_pts, raw_goals, raw_sizes = self.extract_3d_boundary_edges(pts_array)
+        self.last_stats['point_count'] = len(pts_array)
+        self.last_stats['boundary_count'] = 0 if boundary_pts is None else len(boundary_pts)
+        self.last_stats['raw_goal_count'] = 0 if raw_goals is None else len(raw_goals)
+        self.last_stats['filtered_goal_count'] = 0
+        self.last_stats['raw_goal_z_range'] = None
+        self.last_stats['rejections'] = {}
+
+        if raw_goals is not None and len(raw_goals) > 0:
+            self.last_stats['raw_goal_z_range'] = (
+                float(np.min(raw_goals[:, 2])),
+                float(np.max(raw_goals[:, 2])))
         
         # If no boundaries are found, return early with an empty marker array
         if boundary_pts is None or len(boundary_pts) == 0:
@@ -53,6 +76,7 @@ class PointCloudFrontierDetector:
         filtered_goals, filtered_sizes = self.filter_goals(
             raw_goals, raw_sizes, robot_pose, blacklist, visited
         )
+        self.last_stats['filtered_goal_count'] = len(filtered_goals)
 
         # 3. Select the single best goal for navigation based on the chosen strategy
         best_goal = self._select_best_goal(filtered_goals, filtered_sizes, robot_pose)
@@ -61,6 +85,76 @@ class PointCloudFrontierDetector:
         markers = self._generate_markers(boundary_pts, raw_goals, filtered_goals, best_goal)
 
         return best_goal, markers
+
+    def process_occupancy_grid(self, grid, robot_pose, blacklist=None, visited=None):
+        """Find free-to-unknown transitions in the 2D map as exploration frontiers."""
+        if blacklist is None:
+            blacklist = []
+        if visited is None:
+            visited = []
+
+        width = int(grid.info.width)
+        height = int(grid.info.height)
+        data = np.asarray(grid.data, dtype=np.int16).reshape((height, width))
+        free = (data >= 0) & (data < 50)
+        unknown = data < 0
+        frontier_mask = np.zeros((height, width), dtype=bool)
+
+        frontier_mask[1:, :] |= free[1:, :] & unknown[:-1, :]
+        frontier_mask[:-1, :] |= free[:-1, :] & unknown[1:, :]
+        frontier_mask[:, 1:] |= free[:, 1:] & unknown[:, :-1]
+        frontier_mask[:, :-1] |= free[:, :-1] & unknown[:, 1:]
+
+        y_cells, x_cells = np.nonzero(frontier_mask)
+        resolution = float(grid.info.resolution)
+        origin_x = float(grid.info.origin.position.x)
+        origin_y = float(grid.info.origin.position.y)
+        frontier_z = self.params.get('pallet_surface_z')
+        if frontier_z is None:
+            frontier_z = robot_pose[2]
+        boundary_pts = np.column_stack((
+            origin_x + (x_cells + 0.5) * resolution,
+            origin_y + (y_cells + 0.5) * resolution,
+            np.full(len(x_cells), frontier_z)))
+
+        self.last_stats['point_count'] = width * height
+        self.last_stats['boundary_count'] = len(boundary_pts)
+        self.last_stats['raw_goal_count'] = 0
+        self.last_stats['filtered_goal_count'] = 0
+        self.last_stats['raw_goal_z_range'] = None
+        self.last_stats['rejections'] = {}
+
+        if len(boundary_pts) == 0:
+            return None, MarkerArray()
+
+        frontier_pcd = o3d.geometry.PointCloud()
+        frontier_pcd.points = o3d.utility.Vector3dVector(boundary_pts)
+        labels = np.asarray(frontier_pcd.cluster_dbscan(
+            eps=max(2.0 * resolution, self.params['neighbor_radius']), min_points=1))
+
+        raw_goals = []
+        raw_sizes = []
+        for label in range(labels.max() + 1):
+            cluster_pts = boundary_pts[labels == label]
+            if len(cluster_pts) < self.params['min_neighbors']:
+                continue
+            center = np.mean(cluster_pts, axis=0)
+            raw_goals.append(cluster_pts[np.argmin(np.linalg.norm(cluster_pts - center, axis=1))])
+            raw_sizes.append(len(cluster_pts))
+
+        raw_goals = np.asarray(raw_goals)
+        raw_sizes = np.asarray(raw_sizes)
+        self.last_stats['raw_goal_count'] = len(raw_goals)
+        if len(raw_goals) > 0:
+            self.last_stats['raw_goal_z_range'] = (
+                float(np.min(raw_goals[:, 2])), float(np.max(raw_goals[:, 2])))
+
+        filtered_goals, filtered_sizes = self.filter_goals(
+            raw_goals, raw_sizes, robot_pose, blacklist, visited)
+        self.last_stats['filtered_goal_count'] = len(filtered_goals)
+        best_goal = self._select_best_goal(filtered_goals, filtered_sizes, robot_pose)
+        return best_goal, self._generate_markers(
+            boundary_pts, raw_goals, filtered_goals, best_goal)
 
     def extract_3d_boundary_edges(self, pts_array):
         """
@@ -163,17 +257,46 @@ class PointCloudFrontierDetector:
         
         min_dist = self.params['min_dist_from_robot']
         max_z_diff = self.params['max_height_diff']
+        pallet_surface_z = self.params.get('pallet_surface_z')
+        pallet_height_tolerance = self.params['pallet_height_tolerance']
+        pallet_bounds = self.params.get('pallet_bounds')
+        pallet_edge_margin = self.params['pallet_edge_margin']
         
         # Pre-compute squared radii to avoid computing square roots in the loop (optimization)
         visited_rad_sq = self.params['visited_radius'] ** 2
         blacklist_rad_sq = self.params['blacklist_radius'] ** 2
+        rejections = self.last_stats['rejections']
+
+        def reject(reason):
+            rejections[reason] = rejections.get(reason, 0) + 1
 
         for idx, g in enumerate(raw_goals):
             # 1. Height check: Don't target floors above/below current reach
-            if abs(g[2] - robot_pose[2]) > max_z_diff: continue
+            if abs(g[2] - robot_pose[2]) > max_z_diff:
+                reject('robot_height')
+                continue
+
+            # In a floor-is-lava scenario, only the pallet surface is traversable.
+            # This rejects floor frontiers before they can be selected as goals.
+            if pallet_surface_z is not None and abs(g[2] - pallet_surface_z) > pallet_height_tolerance:
+                reject('pallet_height')
+                continue
+
+            # The cloud boundary includes the physical pallet perimeter. Only
+            # accept candidates with a margin from each configured pallet edge.
+            if pallet_bounds is not None:
+                min_x, max_x, min_y, max_y = pallet_bounds
+                inside_pallet = (
+                    min_x + pallet_edge_margin <= g[0] <= max_x - pallet_edge_margin
+                    and min_y + pallet_edge_margin <= g[1] <= max_y - pallet_edge_margin)
+                if not inside_pallet:
+                    reject('pallet_edge')
+                    continue
             
             # 2. Min distance check: Ignore goals directly under the robot
-            if np.linalg.norm(g - robot_pose) < min_dist: continue
+            if np.linalg.norm(g - robot_pose) < min_dist:
+                reject('too_close')
+                continue
                 
             is_invalid = False
             
@@ -181,6 +304,7 @@ class PointCloudFrontierDetector:
             for v in visited:
                 if np.sum((g - v)**2) < visited_rad_sq:
                     is_invalid = True
+                    reject('visited')
                     break
             if is_invalid: continue
             
@@ -188,6 +312,7 @@ class PointCloudFrontierDetector:
             for b in blacklist:
                 if np.sum((g - b)**2) < blacklist_rad_sq:
                     is_invalid = True
+                    reject('blacklisted')
                     break
             if is_invalid: continue
             

@@ -9,6 +9,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, Quaternion
 from visualization_msgs.msg import MarkerArray
 from sensor_msgs.msg import PointCloud2
+from nav_msgs.msg import OccupancyGrid
 import sensor_msgs_py.point_cloud2 as pc2
 from mbf_msgs.action import MoveBase
 import math
@@ -18,9 +19,10 @@ import tf2_ros
 from alert_exploration.utils import PointCloudFrontierDetector
 
 CLOUD_TOPIC = '/octomap_point_cloud_centers'
+MAP_TOPIC = '/projected_map_1m'
 ACTION_SERVER_NAME = '/move_base_flex/move_base'
 MAP_FRAME = 'map'
-ROBOT_FRAME = 'body'
+ROBOT_FRAME = 'base_link'
 MIN_GOAL_DISTANCE = 0.5
 GOAL_OFFSET_DISTANCE = 0.75  
 WAIT_AFTER_SUCCESS = 1.0
@@ -31,9 +33,48 @@ MAX_NO_FRONTIER_TICKS = 10  # Seconds to wait with no goals before triggering Ph
 class FrontierNavigationManager(Node):
     def __init__(self):
         super().__init__('frontier_navigation_manager')
-        
+
+        self.declare_parameter('pallet_surface_z', float('nan'))
+        self.declare_parameter('pallet_height_tolerance', 0.12)
+        self.declare_parameter('pallet_min_x', float('nan'))
+        self.declare_parameter('pallet_max_x', float('nan'))
+        self.declare_parameter('pallet_min_y', float('nan'))
+        self.declare_parameter('pallet_max_y', float('nan'))
+        self.declare_parameter('pallet_edge_margin', 0.5)
+
+        pallet_surface_z = self.get_parameter('pallet_surface_z').value
+        if math.isnan(pallet_surface_z):
+            pallet_surface_z = None
+
+        pallet_bounds = tuple(self.get_parameter(name).value for name in (
+            'pallet_min_x', 'pallet_max_x', 'pallet_min_y', 'pallet_max_y'))
+        if not all(math.isfinite(value) for value in pallet_bounds):
+            pallet_bounds = None
+
         self.get_logger().info("Initializing 3D Frontier Manager (With Phase 2 Cleanup)...")
-        self.detector = PointCloudFrontierDetector()
+        self.detector = PointCloudFrontierDetector({
+            'pallet_surface_z': pallet_surface_z,
+            'pallet_height_tolerance': self.get_parameter(
+                'pallet_height_tolerance').value,
+            'pallet_bounds': pallet_bounds,
+            'pallet_edge_margin': self.get_parameter('pallet_edge_margin').value,
+        })
+
+        if pallet_surface_z is None:
+            self.get_logger().warn(
+                "pallet_surface_z is unset; floor points are not being rejected. "
+                "Set it in the launch file for floor-is-lava navigation.")
+        else:
+            self.get_logger().info(
+                f"Pallet-only navigation enabled at z={pallet_surface_z:.3f} m")
+
+        if pallet_bounds is None:
+            self.get_logger().warn(
+                "Pallet bounds are unset; pallet-edge frontiers are not being "
+                "rejected. Set pallet_min/max_x/y for floor-is-lava navigation.")
+        else:
+            self.get_logger().info(
+                f"Pallet edge exclusion enabled with {self.get_parameter('pallet_edge_margin').value:.2f} m margin")
 
         self.goal_start_time = None
         self.goal_handle = None
@@ -46,6 +87,8 @@ class FrontierNavigationManager(Node):
 
         self.cloud_sub = self.create_subscription(
             PointCloud2, CLOUD_TOPIC, self.cloud_callback, qos)
+        self.map_sub = self.create_subscription(
+            OccupancyGrid, MAP_TOPIC, self.map_callback, qos)
         
         self.marker_pub = self.create_publisher(MarkerArray, '/frontier_debug_markers', 10)
 
@@ -97,6 +140,9 @@ class FrontierNavigationManager(Node):
         self.get_logger().info(f"New Visited Radius: {self.detector.params['visited_radius']}m")
 
     def cloud_callback(self, msg):
+        return
+
+    def map_callback(self, msg):
         if self.is_processing or self.is_navigating: return
         self.is_processing = True
 
@@ -105,22 +151,10 @@ class FrontierNavigationManager(Node):
             self.robot_pose = np.array([
                 trans.transform.translation.x,
                 trans.transform.translation.y,
-                trans.transform.translation.z
-            ])
-        except Exception:
-            self.is_processing = False
-            return
+                trans.transform.translation.z])
 
-        try:
-            cloud_generator = pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
-            pts_array = np.array([[float(p[0]), float(p[1]), float(p[2])] for p in cloud_generator], dtype=np.float64)
-            
-            if pts_array.shape[0] < 10:
-                self.is_processing = False
-                return
-
-            goal, markers = self.detector.process_pointcloud(
-                pts_array, 
+            goal, markers = self.detector.process_occupancy_grid(
+                msg,
                 self.robot_pose, 
                 blacklist=self.blacklisted_goals,
                 visited=self.visited_goals
@@ -128,6 +162,19 @@ class FrontierNavigationManager(Node):
 
             self.marker_pub.publish(markers)
             self.latest_goal_coords = goal
+
+            if goal is None:
+                stats = self.detector.last_stats
+                self.get_logger().info(
+                    "Frontier debug: "
+                    f"points={stats['point_count']}, "
+                    f"boundary_points={stats['boundary_count']}, "
+                    f"raw_goals={stats['raw_goal_count']}, "
+                    f"filtered_goals={stats['filtered_goal_count']}, "
+                    f"raw_goal_z={stats['raw_goal_z_range']}, "
+                    f"rejections={stats['rejections']}, "
+                    f"pallet_z={self.detector.params.get('pallet_surface_z')}",
+                    throttle_duration_sec=5.0)
             
         except Exception as e:
             self.get_logger().error(f"Error in perception callback: {e}")
